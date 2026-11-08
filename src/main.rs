@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPricing {
@@ -265,7 +265,6 @@ async fn get_openai_models(
 
     let mut items: Vec<OpenAIModelItem> = Vec::with_capacity(list.len() + 8);
 
-    // Dynamic aliases
     let aliases = [
         "auto-free",
         "free:top-1",
@@ -332,13 +331,125 @@ async fn get_models(
     }))
 }
 
-// Handler POST /v1/chat/completions (Forward & Stream to OpenRouter)
+fn resolve_target_candidates(requested: &str, all_models: &[ProcessedModel]) -> Vec<String> {
+    match requested {
+        "auto-free" | "free:top-1" => {
+            let q = FilterQuery {
+                variant: Some("free".to_string()),
+                output: Some("text".to_string()),
+                sort: Some("top-weekly".to_string()),
+                max_price: None,
+                tools: None,
+                limit: Some(3),
+            };
+            let list = filter_and_sort_models(all_models, &q);
+            let mut res: Vec<String> = list.into_iter().map(|m| m.id).collect();
+            if res.is_empty() {
+                res.push("stealth/crouton-alpha".to_string());
+            }
+            res
+        }
+        "free:top-2" => {
+            let q = FilterQuery {
+                variant: Some("free".to_string()),
+                output: Some("text".to_string()),
+                sort: Some("top-weekly".to_string()),
+                max_price: None,
+                tools: None,
+                limit: Some(4),
+            };
+            let list = filter_and_sort_models(all_models, &q);
+            let mut res: Vec<String> = list.into_iter().skip(1).map(|m| m.id).collect();
+            if res.is_empty() {
+                res.push("nvidia/nemotron-3-ultra-550b-a55b:free".to_string());
+            }
+            res
+        }
+        "free:top-3" => {
+            let q = FilterQuery {
+                variant: Some("free".to_string()),
+                output: Some("text".to_string()),
+                sort: Some("top-weekly".to_string()),
+                max_price: None,
+                tools: None,
+                limit: Some(5),
+            };
+            let list = filter_and_sort_models(all_models, &q);
+            let mut res: Vec<String> = list.into_iter().skip(2).map(|m| m.id).collect();
+            if res.is_empty() {
+                res.push("nvidia/nemotron-3.5-super-vl:free".to_string());
+            }
+            res
+        }
+        "free:context" => {
+            let q = FilterQuery {
+                variant: Some("free".to_string()),
+                output: Some("text".to_string()),
+                sort: Some("context".to_string()),
+                max_price: None,
+                tools: None,
+                limit: Some(3),
+            };
+            let list = filter_and_sort_models(all_models, &q);
+            let mut res: Vec<String> = list.into_iter().map(|m| m.id).collect();
+            if res.is_empty() {
+                res.push("stealth/crouton-alpha".to_string());
+            }
+            res
+        }
+        "free:tools" => {
+            let q = FilterQuery {
+                variant: Some("free".to_string()),
+                output: Some("text".to_string()),
+                sort: Some("top-weekly".to_string()),
+                max_price: None,
+                tools: Some(true),
+                limit: Some(3),
+            };
+            let list = filter_and_sort_models(all_models, &q);
+            let mut res: Vec<String> = list.into_iter().map(|m| m.id).collect();
+            if res.is_empty() {
+                res.push("stealth/crouton-alpha".to_string());
+            }
+            res
+        }
+        "free:coding" | "auto-free-coding" => {
+            let mut res: Vec<String> = all_models
+                .iter()
+                .filter(|m| m.is_free && (m.id.contains("code") || m.id.contains("flint")))
+                .map(|m| m.id.clone())
+                .collect();
+            if res.is_empty() {
+                res.push("cohere/north-mini-code:free".to_string());
+            }
+            res
+        }
+        "cheapest:text" => {
+            let q = FilterQuery {
+                variant: Some("paid".to_string()),
+                output: Some("text".to_string()),
+                sort: Some("cheapest".to_string()),
+                max_price: None,
+                tools: None,
+                limit: Some(3),
+            };
+            let list = filter_and_sort_models(all_models, &q);
+            let mut res: Vec<String> = list.into_iter().map(|m| m.id).collect();
+            if res.is_empty() {
+                res.push("deepseek/deepseek-v4.1-flash-1017".to_string());
+            }
+            res
+        }
+        custom => vec![custom.to_string()],
+    }
+}
+
+// Handler POST /v1/chat/completions (Forward & Stream to OpenRouter with Auto-Fallback on 429/503)
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(mut payload): Json<serde_json::Value>,
 ) -> Result<Response, (StatusCode, String)> {
-    // 1. Resolve Authorization Header (use client token or fallback to .env)
     let auth_header = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -351,147 +462,97 @@ async fn chat_completions(
             )
         })?;
 
-    // 2. Resolve requested model
     let requested_model = payload
         .get("model")
         .and_then(|v| v.as_str())
-        .unwrap_or("auto-free");
+        .unwrap_or("auto-free")
+        .to_string();
 
     let all_models = state.models.read().await;
-
-    let target_model = match requested_model {
-        "auto-free" | "free:top-1" => {
-            let q = FilterQuery {
-                variant: Some("free".to_string()),
-                output: Some("text".to_string()),
-                sort: Some("top-weekly".to_string()),
-                max_price: None,
-                tools: None,
-                limit: Some(1),
-            };
-            let list = filter_and_sort_models(&all_models, &q);
-            list.first().map(|m| m.id.clone()).unwrap_or_else(|| "stealth/crouton-alpha".to_string())
-        }
-        "free:top-2" => {
-            let q = FilterQuery {
-                variant: Some("free".to_string()),
-                output: Some("text".to_string()),
-                sort: Some("top-weekly".to_string()),
-                max_price: None,
-                tools: None,
-                limit: Some(2),
-            };
-            let list = filter_and_sort_models(&all_models, &q);
-            list.get(1).map(|m| m.id.clone()).unwrap_or_else(|| "nvidia/nemotron-3-ultra-550b-a55b:free".to_string())
-        }
-        "free:top-3" => {
-            let q = FilterQuery {
-                variant: Some("free".to_string()),
-                output: Some("text".to_string()),
-                sort: Some("top-weekly".to_string()),
-                max_price: None,
-                tools: None,
-                limit: Some(3),
-            };
-            let list = filter_and_sort_models(&all_models, &q);
-            list.get(2).map(|m| m.id.clone()).unwrap_or_else(|| "nvidia/nemotron-3.5-super-vl:free".to_string())
-        }
-        "free:context" => {
-            let q = FilterQuery {
-                variant: Some("free".to_string()),
-                output: Some("text".to_string()),
-                sort: Some("context".to_string()),
-                max_price: None,
-                tools: None,
-                limit: Some(1),
-            };
-            let list = filter_and_sort_models(&all_models, &q);
-            list.first().map(|m| m.id.clone()).unwrap_or_else(|| "stealth/crouton-alpha".to_string())
-        }
-        "free:tools" => {
-            let q = FilterQuery {
-                variant: Some("free".to_string()),
-                output: Some("text".to_string()),
-                sort: Some("top-weekly".to_string()),
-                max_price: None,
-                tools: Some(true),
-                limit: Some(1),
-            };
-            let list = filter_and_sort_models(&all_models, &q);
-            list.first().map(|m| m.id.clone()).unwrap_or_else(|| "stealth/crouton-alpha".to_string())
-        }
-        "free:coding" | "auto-free-coding" => {
-            all_models
-                .iter()
-                .find(|m| m.is_free && (m.id.contains("code") || m.id.contains("flint")))
-                .map(|m| m.id.clone())
-                .unwrap_or_else(|| "cohere/north-mini-code:free".to_string())
-        }
-        "cheapest:text" => {
-            let q = FilterQuery {
-                variant: Some("paid".to_string()),
-                output: Some("text".to_string()),
-                sort: Some("cheapest".to_string()),
-                max_price: None,
-                tools: None,
-                limit: Some(1),
-            };
-            let list = filter_and_sort_models(&all_models, &q);
-            list.first().map(|m| m.id.clone()).unwrap_or_else(|| "deepseek/deepseek-v4.1-flash-1017".to_string())
-        }
-        custom => custom.to_string(),
-    };
-
+    let candidates = resolve_target_candidates(&requested_model, &all_models);
     drop(all_models);
 
-    info!("Routing: '{}' -> '{}'", requested_model, target_model);
-
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("model".to_string(), serde_json::Value::String(target_model));
-    }
-
-    // 3. Forward request to OpenRouter upstream
     let openrouter_url = "https://openrouter.ai/api/v1/chat/completions";
-    let upstream_res = state
-        .http_client
-        .post(openrouter_url)
-        .header(header::AUTHORIZATION, auth_header)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header("HTTP-Referer", "http://localhost:3033")
-        .header("X-Title", "OpenRouter Free Finder")
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Upstream OpenRouter connection error: {}", e);
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to connect to OpenRouter: {}", e),
-            )
-        })?;
 
-    let upstream_status = upstream_res.status();
+    let mut last_response = None;
 
-    // 4. Stream response back to client (preserves SSE streaming or plain JSON)
-    let mut response_builder = Response::builder().status(upstream_status);
+    for (attempt, target_model) in candidates.iter().enumerate() {
+        if attempt > 0 {
+            warn!("⚠️ Fallback attempt #{}: switching to model '{}'", attempt, target_model);
+        } else {
+            info!("Routing: '{}' -> '{}'", requested_model, target_model);
+        }
 
-    for (k, v) in upstream_res.headers().iter() {
-        if k == header::CONTENT_TYPE || k == header::CACHE_CONTROL || k.as_str().starts_with("x-") {
-            if let (Ok(hname), Ok(hval)) = (
-                HeaderName::from_bytes(k.as_str().as_bytes()),
-                HeaderValue::from_bytes(v.as_bytes()),
-            ) {
-                response_builder = response_builder.header(hname, hval);
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("model".to_string(), serde_json::Value::String(target_model.clone()));
+        }
+
+        let upstream_res = match state
+            .http_client
+            .post(openrouter_url)
+            .header(header::AUTHORIZATION, &auth_header)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("HTTP-Referer", "http://localhost:3033")
+            .header("X-Title", "OpenRouter Free Finder")
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(res) => res,
+            Err(e) => {
+                error!("Connection error with '{}': {}", target_model, e);
+                continue;
+            }
+        };
+
+        let status = upstream_res.status();
+
+        // If rate-limited (429) or overloaded (502/503) and there are more candidates, try fallback
+        if (status == StatusCode::TOO_MANY_REQUESTS
+            || status == StatusCode::SERVICE_UNAVAILABLE
+            || status == StatusCode::BAD_GATEWAY)
+            && attempt + 1 < candidates.len()
+        {
+            warn!("Model '{}' returned status {}. Trying next fallback candidate...", target_model, status);
+            last_response = Some(upstream_res);
+            continue;
+        }
+
+        // Success or non-retryable status: stream back directly
+        let mut response_builder = Response::builder().status(status);
+
+        for (k, v) in upstream_res.headers().iter() {
+            if k == header::CONTENT_TYPE || k == header::CACHE_CONTROL || k.as_str().starts_with("x-") {
+                if let (Ok(hname), Ok(hval)) = (
+                    HeaderName::from_bytes(k.as_str().as_bytes()),
+                    HeaderValue::from_bytes(v.as_bytes()),
+                ) {
+                    response_builder = response_builder.header(hname, hval);
+                }
             }
         }
+
+        let stream = upstream_res.bytes_stream().map_err(std::io::Error::other);
+        let body = Body::from_stream(stream);
+
+        return response_builder
+            .body(body)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
     }
 
-    let stream = upstream_res.bytes_stream().map_err(std::io::Error::other);
-    let body = Body::from_stream(stream);
+    if let Some(res) = last_response {
+        let status = res.status();
+        let response_builder = Response::builder().status(status);
+        let stream = res.bytes_stream().map_err(std::io::Error::other);
+        return response_builder
+            .body(Body::from_stream(stream))
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    }
 
-    response_builder
-        .body(body)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    Err((
+        StatusCode::BAD_GATEWAY,
+        "All candidate models failed to respond.".to_string(),
+    ))
 }
 
 async fn sync_models(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
