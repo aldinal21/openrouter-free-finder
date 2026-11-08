@@ -166,13 +166,15 @@ async fn main() {
         .with_state(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3033".to_string());
-    let addr = format!("127.0.0.1:{}", port);
+    let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("Failed to bind {}: {}", addr, e));
 
-    info!("🚀 Server running on http://{}", addr);
-    info!("👉 OpenAI Base URL: http://localhost:{}/v1", port);
+    info!("🚀 Server running on http://0.0.0.0:{}", port);
+    info!("👉 Local URL: http://127.0.0.1:{}/v1", port);
+    info!("👉 Network LAN URL: http://192.168.1.200:{}/v1", port);
     info!("👉 Dynamic Aliases: free:top-1, free:top-2, free:context, free:tools, free:coding, cheapest:text");
 
     axum::serve(listener, app).await.expect("Server error");
