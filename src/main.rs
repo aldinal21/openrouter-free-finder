@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPricing {
@@ -111,7 +111,6 @@ pub struct OpenAIModelsResponse {
 
 #[tokio::main]
 async fn main() {
-    // Load .env if present
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
@@ -123,9 +122,9 @@ async fn main() {
 
     let api_key = std::env::var("OPENROUTER_API_KEY").ok();
     if api_key.is_some() {
-        info!("🔑 OPENROUTER_API_KEY detected.");
+        info!("🔑 OPENROUTER_API_KEY detected in .env for local fallback.");
     } else {
-        warn!("⚠️ OPENROUTER_API_KEY not found in env. Client must pass Authorization header.");
+        info!("ℹ️ Client Authorization header will be inherited directly.");
     }
 
     let client = reqwest::Client::builder()
@@ -139,7 +138,6 @@ async fn main() {
         api_key,
     });
 
-    // Initial fetch
     info!("Performing initial OpenRouter catalog & ranking fetch...");
     if let Err(e) = sync_models(state.clone()).await {
         error!("Initial sync failed: {}", e);
@@ -174,8 +172,8 @@ async fn main() {
         .unwrap_or_else(|e| panic!("Failed to bind {}: {}", addr, e));
 
     info!("🚀 Server running on http://{}", addr);
-    info!("👉 OpenAI Base URL for Omniroute: http://localhost:{}/v1", port);
-    info!("👉 Virtual Models: 'auto-free', 'auto-free-coding'");
+    info!("👉 OpenAI Base URL: http://localhost:{}/v1", port);
+    info!("👉 Dynamic Aliases: free:top-1, free:top-2, free:context, free:tools, free:coding, cheapest:text");
 
     axum::serve(listener, app).await.expect("Server error");
 }
@@ -265,21 +263,28 @@ async fn get_openai_models(
         list.truncate(limit);
     }
 
-    let mut items: Vec<OpenAIModelItem> = Vec::with_capacity(list.len() + 2);
+    let mut items: Vec<OpenAIModelItem> = Vec::with_capacity(list.len() + 8);
 
-    // Prepend virtual alias models
-    items.push(OpenAIModelItem {
-        id: "auto-free".to_string(),
-        object: "model".to_string(),
-        created: 1793669930,
-        owned_by: "smart-proxy".to_string(),
-    });
-    items.push(OpenAIModelItem {
-        id: "auto-free-coding".to_string(),
-        object: "model".to_string(),
-        created: 1793669930,
-        owned_by: "smart-proxy".to_string(),
-    });
+    // Dynamic aliases
+    let aliases = [
+        "auto-free",
+        "free:top-1",
+        "free:top-2",
+        "free:top-3",
+        "free:context",
+        "free:tools",
+        "free:coding",
+        "cheapest:text",
+    ];
+
+    for alias in aliases {
+        items.push(OpenAIModelItem {
+            id: alias.to_string(),
+            object: "model".to_string(),
+            created: 1793669930,
+            owned_by: "smart-proxy".to_string(),
+        });
+    }
 
     for m in list {
         let owner = m.id.split('/').next().unwrap_or("openrouter").to_string();
@@ -333,7 +338,7 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(mut payload): Json<serde_json::Value>,
 ) -> Result<Response, (StatusCode, String)> {
-    // 1. Resolve Authorization Header (use incoming header or fallback to .env OPENROUTER_API_KEY)
+    // 1. Resolve Authorization Header (use client token or fallback to .env)
     let auth_header = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -342,7 +347,7 @@ async fn chat_completions(
         .ok_or_else(|| {
             (
                 StatusCode::UNAUTHORIZED,
-                "Missing Authorization header and no OPENROUTER_API_KEY configured.".to_string(),
+                "Missing Authorization header. Please pass your OpenRouter API key.".to_string(),
             )
         })?;
 
@@ -352,11 +357,11 @@ async fn chat_completions(
         .and_then(|v| v.as_str())
         .unwrap_or("auto-free");
 
+    let all_models = state.models.read().await;
+
     let target_model = match requested_model {
-        "auto-free" => {
-            // Pick top #1 weekly free model
-            let models = state.models.read().await;
-            let query = FilterQuery {
+        "auto-free" | "free:top-1" => {
+            let q = FilterQuery {
                 variant: Some("free".to_string()),
                 output: Some("text".to_string()),
                 sort: Some("top-weekly".to_string()),
@@ -364,26 +369,83 @@ async fn chat_completions(
                 tools: None,
                 limit: Some(1),
             };
-            let top = filter_and_sort_models(&models, &query);
-            top.first()
-                .map(|m| m.id.clone())
-                .unwrap_or_else(|| "stealth/crouton-alpha".to_string())
+            let list = filter_and_sort_models(&all_models, &q);
+            list.first().map(|m| m.id.clone()).unwrap_or_else(|| "stealth/crouton-alpha".to_string())
         }
-        "auto-free-coding" => {
-            // Find coding free model if exists, or top #1
-            let models = state.models.read().await;
-            models
+        "free:top-2" => {
+            let q = FilterQuery {
+                variant: Some("free".to_string()),
+                output: Some("text".to_string()),
+                sort: Some("top-weekly".to_string()),
+                max_price: None,
+                tools: None,
+                limit: Some(2),
+            };
+            let list = filter_and_sort_models(&all_models, &q);
+            list.get(1).map(|m| m.id.clone()).unwrap_or_else(|| "nvidia/nemotron-3-ultra-550b-a55b:free".to_string())
+        }
+        "free:top-3" => {
+            let q = FilterQuery {
+                variant: Some("free".to_string()),
+                output: Some("text".to_string()),
+                sort: Some("top-weekly".to_string()),
+                max_price: None,
+                tools: None,
+                limit: Some(3),
+            };
+            let list = filter_and_sort_models(&all_models, &q);
+            list.get(2).map(|m| m.id.clone()).unwrap_or_else(|| "nvidia/nemotron-3.5-super-vl:free".to_string())
+        }
+        "free:context" => {
+            let q = FilterQuery {
+                variant: Some("free".to_string()),
+                output: Some("text".to_string()),
+                sort: Some("context".to_string()),
+                max_price: None,
+                tools: None,
+                limit: Some(1),
+            };
+            let list = filter_and_sort_models(&all_models, &q);
+            list.first().map(|m| m.id.clone()).unwrap_or_else(|| "stealth/crouton-alpha".to_string())
+        }
+        "free:tools" => {
+            let q = FilterQuery {
+                variant: Some("free".to_string()),
+                output: Some("text".to_string()),
+                sort: Some("top-weekly".to_string()),
+                max_price: None,
+                tools: Some(true),
+                limit: Some(1),
+            };
+            let list = filter_and_sort_models(&all_models, &q);
+            list.first().map(|m| m.id.clone()).unwrap_or_else(|| "stealth/crouton-alpha".to_string())
+        }
+        "free:coding" | "auto-free-coding" => {
+            all_models
                 .iter()
                 .find(|m| m.is_free && (m.id.contains("code") || m.id.contains("flint")))
                 .map(|m| m.id.clone())
-                .unwrap_or_else(|| "stealth/crouton-alpha".to_string())
+                .unwrap_or_else(|| "cohere/north-mini-code:free".to_string())
+        }
+        "cheapest:text" => {
+            let q = FilterQuery {
+                variant: Some("paid".to_string()),
+                output: Some("text".to_string()),
+                sort: Some("cheapest".to_string()),
+                max_price: None,
+                tools: None,
+                limit: Some(1),
+            };
+            let list = filter_and_sort_models(&all_models, &q);
+            list.first().map(|m| m.id.clone()).unwrap_or_else(|| "deepseek/deepseek-v4.1-flash-1017".to_string())
         }
         custom => custom.to_string(),
     };
 
-    info!("Forwarding chat request: '{}' -> '{}'", requested_model, target_model);
+    drop(all_models);
 
-    // Update payload with resolved model
+    info!("Routing: '{}' -> '{}'", requested_model, target_model);
+
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("model".to_string(), serde_json::Value::String(target_model));
     }
