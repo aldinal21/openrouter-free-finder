@@ -35,9 +35,39 @@ cargo build --release
 
 ---
 
+## Deploy di Debian (systemd user service)
+
+Lokasi: `~/Apps/openrouter-free-finder` di `192.168.1.201`, port `3033`.
+
+```bash
+# build (pakai rustup toolchain, bukan cargo paket Debian yang masih 1.85)
+cd ~/Apps/openrouter-free-finder
+~/.cargo/bin/cargo build --release
+
+# service
+systemctl --user daemon-reload
+systemctl --user enable --now openrouter-free-finder
+systemctl --user status openrouter-free-finder
+
+# log
+journalctl --user -u openrouter-free-finder -f
+```
+
+Update kode setelah edit:
+```bash
+cd ~/Apps/openrouter-free-finder
+~/.cargo/bin/cargo build --release && systemctl --user restart openrouter-free-finder
+```
+
+File service: `~/.config/systemd/user/openrouter-free-finder.service`
+(`WorkingDirectory`, `EnvironmentFile=.env`, `LAN_IP`, `Restart=always`).
+Linger sudah aktif, jadi service tetap jalan tanpa login.
+
+---
+
 ## Setup di Omniroute / Client OpenAI
 
-- **Base URL:** `http://127.0.0.1:3033/v1`
+- **Base URL:** `http://192.168.1.201:3033/v1`
 - **API Key:** Masukkan OpenRouter API Key kamu sendiri.
 - **Model Name:** Pilih `auto-free` (atau salah satu dari virtual models di atas).
 

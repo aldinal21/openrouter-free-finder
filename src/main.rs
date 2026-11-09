@@ -391,8 +391,9 @@ async fn main() {
         .unwrap_or_else(|e| panic!("Failed to bind {}: {}", addr, e));
 
     info!("🚀 Server running on http://0.0.0.0:{}", port);
-    info!("👉 OmniRoute Base URL: http://192.168.1.200:{}", port);
-    info!("👉 OmniRoute Base URL (alt): http://192.168.1.200:{}/v1", port);
+    let lan_ip = std::env::var("LAN_IP").unwrap_or_else(|_| "localhost".to_string());
+    info!("👉 OmniRoute Base URL: http://{}:{}", lan_ip, port);
+    info!("👉 OmniRoute Base URL (alt): http://{}:{}/v1", lan_ip, port);
 
     axum::serve(listener, app).await.expect("Server error");
 }
