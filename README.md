@@ -16,6 +16,29 @@ Ultra-lightweight micro-service written in Rust (`axum` + `tokio`) that acts as 
 4. **Auto-Fallback Transparan:** Jika model gratis pilihan terkena rate-limit (`429`) atau down (`502`/`503`), proxy otomatis mencoba kandidat gratis berikutnya tanpa memutus chat.
 5. **Key Passthrough:** Meneruskan header `Authorization: Bearer <key>` milik client/user secara langsung ke OpenRouter (dengan opsi fallback ke `.env` untuk pengujian lokal).
 6. **In-Memory Refresh:** Sinkronisasi katalog berjalan di background setiap 15 menit, latency response API lokal **< 1ms**.
+7. **Timeout per Attempt:** Setiap percobaan ke satu model dibatasi `UPSTREAM_TIMEOUT_SECS` (default `60`) lalu pindah ke kandidat berikutnya, jadi satu model hang tidak menahan request berjam-jam.
+8. **Streaming Aman:** Byte stream ditahan sampai token teks pertama muncul. Stream yang hanya berisi reasoning (client akan melihatnya kosong) dianggap gagal dan di-fallback ke kandidat berikutnya.
+9. **Modality & Context Aware:** Request bergambar/audio/file/video hanya diarahkan ke model yang mendukung modality tersebut, dan prompt besar difilter berdasarkan `context_length`.
+
+---
+
+## Cara Menjalankan
+
+### Mode Dev
+```bash
+cargo run
+```
+*Server berjalan di `http://127.0.0.1:3033` (port dapat diubah via env `PORT`).*
+
+### Environment Variables
+| Env | Default | Fungsi |
+| :--- | :--- | :--- |
+| `PORT` | `3033` | Port HTTP |
+| `HOST` | `0.0.0.0` | Bind address |
+| `LAN_IP` | `localhost` | Hanya untuk log hint Base URL |
+| `UPSTREAM_TIMEOUT_SECS` | `60` | Budget per percobaan ke satu model |
+| `OPENROUTER_API_KEY` | – | Fallback key bila client tidak mengirim `Authorization` |
+
 
 ---
 
@@ -67,9 +90,22 @@ Linger sudah aktif, jadi service tetap jalan tanpa login.
 
 ## Setup di Omniroute / Client OpenAI
 
-- **Base URL:** `http://192.168.1.201:3033/v1`
+- **Base URL:** `http://192.168.1.201:3033/v1` (atau `http://host.docker.internal:3033/v1` bila client-nya container Docker)
 - **API Key:** Masukkan OpenRouter API Key kamu sendiri.
 - **Model Name:** Pilih `auto-free` (atau salah satu dari virtual models di atas).
+
+### Kalau OmniRoute jalan di Docker
+`127.0.0.1` di dalam container menunjuk ke container itu sendiri, bukan ke host.
+Pilih salah satu:
+
+1. Pakai IP LAN host: `http://192.168.1.201:3033/v1`
+2. Pakai `host.docker.internal:3033/v1` — butuh satu baris di compose service:
+   ```yaml
+   extra_hosts:
+     - "host.docker.internal:host-gateway"
+   ```
+   lalu `docker compose up -d omniroute`. Sudah terpasang di `~/Apps/OmniRoute/docker-compose.yml`.
+
 
 ---
 

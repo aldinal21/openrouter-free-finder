@@ -1,12 +1,12 @@
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{Query, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -80,6 +80,8 @@ pub struct AppState {
     pub models: RwLock<Vec<ProcessedModel>>,
     pub http_client: reqwest::Client,
     pub api_key: Option<String>,
+    /// Per-attempt wall clock budget for one upstream model call.
+    pub attempt_timeout: Duration,
     /// model_id -> instant until which the model is skipped (recent 429/5xx)
     pub cooldown: Mutex<HashMap<String, Instant>>,
 }
@@ -262,6 +264,102 @@ fn has_text_content(v: &serde_json::Value) -> bool {
     }
 }
 
+/// Bytes we are willing to buffer while waiting for the first real text token.
+/// Reasoning-only streams are dropped instead of forwarded as empty answers.
+const STREAM_PREAMBLE_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// True when an SSE block carries assistant text, a tool call, or a function call.
+fn sse_has_text(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+
+    for line in text.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("data:") else {
+            continue;
+        };
+        let rest = rest.trim();
+        if rest.is_empty() || rest == "[DONE]" {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(rest) else {
+            continue;
+        };
+        let Some(choices) = v.get("choices").and_then(|c| c.as_array()) else {
+            continue;
+        };
+
+        for choice in choices {
+            let Some(delta) = choice.get("delta") else {
+                continue;
+            };
+            match delta.get("content") {
+                Some(serde_json::Value::String(s)) if !s.is_empty() => return true,
+                Some(serde_json::Value::Array(a)) if !a.is_empty() => return true,
+                _ => {}
+            }
+            if delta
+                .get("tool_calls")
+                .and_then(|t| t.as_array())
+                .map(|t| !t.is_empty())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            if delta.get("function_call").is_some() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Pull chunks from `stream` until one carries real text, the stream ends, or
+/// the budget is exhausted. Everything read so far is returned so the handler
+/// can replay it once it commits to this model.
+///
+/// `None` means text was found; `Some(reason)` means the model produced nothing
+/// usable and the next candidate should be tried.
+async fn prime_stream<S, E>(
+    stream: &mut S,
+    deadline: tokio::time::Instant,
+    max_bytes: usize,
+) -> (Vec<Bytes>, Option<&'static str>)
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    let mut pending: Vec<Bytes> = Vec::new();
+    let mut pending_len = 0usize;
+    let mut scan: Vec<u8> = Vec::new();
+
+    loop {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Err(_) => return (pending, Some("timed out waiting for the first token")),
+            Ok(None) => {
+                let saw = !scan.is_empty() && sse_has_text(&scan);
+                return (pending, if saw { None } else { Some("stream ended without text") });
+            }
+            Ok(Some(Err(_))) => return (pending, Some("stream error before any text")),
+            Ok(Some(Ok(chunk))) => {
+                pending_len += chunk.len();
+                pending.push(chunk.clone());
+                scan.extend_from_slice(&chunk);
+
+                if let Some(pos) = scan.iter().rposition(|b| *b == b'\n') {
+                    let saw = sse_has_text(&scan[..=pos]);
+                    scan.drain(..=pos);
+                    if saw {
+                        return (pending, None);
+                    }
+                }
+
+                if pending_len > max_bytes {
+                    return (pending, Some("too much output without any text"));
+                }
+            }
+        }
+    }
+}
+
 /// Drop candidates that are cooling down. If every candidate is cooling down we
 /// return the original list, so a stale cooldown never causes a hard outage.
 fn filter_cooling(state: &AppState, candidates: Vec<String>) -> Vec<String> {
@@ -341,15 +439,26 @@ async fn main() {
         info!("ℹ️ Client Authorization header will be inherited directly.");
     }
 
+    // No client-wide timeout: streaming responses must not be cut mid-answer.
+    // Non-streaming calls get an explicit per-request budget instead.
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .connect_timeout(Duration::from_secs(10))
         .build()
         .expect("Failed to build HTTP client");
+
+    let attempt_timeout = std::env::var("UPSTREAM_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(60));
+    info!("⏱️ Per-attempt upstream timeout: {}s", attempt_timeout.as_secs());
 
     let state = Arc::new(AppState {
         models: RwLock::new(Vec::new()),
         http_client: client,
         api_key,
+        attempt_timeout,
         cooldown: Mutex::new(HashMap::new()),
     });
 
@@ -768,6 +877,11 @@ async fn chat_completions(
 
     let openrouter_url = "https://openrouter.ai/api/v1/chat/completions";
 
+    let streaming = payload
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let mut last_response = None;
     let mut injected_reasoning = false;
 
@@ -792,21 +906,46 @@ async fn chat_completions(
             }
         }
 
-        let upstream_res = match state
+        let request = state
             .http_client
             .post(openrouter_url)
             .header(header::AUTHORIZATION, &auth_header)
             .header(header::CONTENT_TYPE, "application/json")
             .header("HTTP-Referer", "http://localhost:3033")
             .header("X-Title", "OpenRouter Free Finder")
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(res) => res,
-            Err(e) => {
-                error!("Connection error with '{}': {}", target_model, e);
+            .json(&payload);
+
+        // Streaming bodies can legitimately run long, so the budget only covers
+        // the wait for headers plus the first content chunk (handled below).
+        let request = if streaming {
+            request
+        } else {
+            request.timeout(state.attempt_timeout)
+        };
+
+        let upstream_res = match tokio::time::timeout(state.attempt_timeout, request.send()).await {
+            Err(_) => {
+                warn!(
+                    "Model '{}' did not answer within {}s. Cooling down 30s, trying next candidate...",
+                    target_model,
+                    state.attempt_timeout.as_secs()
+                );
                 mark_cooldown(&state, target_model, 30);
+                continue;
+            }
+            Ok(Ok(res)) => res,
+            Ok(Err(e)) => {
+                if e.is_timeout() {
+                    warn!(
+                        "Model '{}' timed out after {}s. Cooling down 30s, trying next candidate...",
+                        target_model,
+                        state.attempt_timeout.as_secs()
+                    );
+                    mark_cooldown(&state, target_model, 30);
+                } else {
+                    error!("Connection error with '{}': {}", target_model, e);
+                    mark_cooldown(&state, target_model, 30);
+                }
                 continue;
             }
         };
@@ -871,11 +1010,6 @@ async fn chat_completions(
 
         // Non-streaming: a 200 with no text content (all tokens spent on reasoning)
         // is a silent failure for OpenAI clients. Treat it as a failed attempt.
-        let streaming = payload
-            .get("stream")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
         if !streaming {
             let mut response_builder = Response::builder().status(status);
 
@@ -932,11 +1066,33 @@ async fn chat_completions(
             }
         }
 
-        let stream = upstream_res.bytes_stream().map_err(std::io::Error::other);
-        let body = Body::from_stream(stream);
+        // Hold the stream back until the model emits real text. A stream that
+        // only carries reasoning deltas would look empty to the client, so it is
+        // still safe to switch to the next candidate at this point.
+        let mut upstream_stream = Box::pin(upstream_res.bytes_stream());
+        let deadline = tokio::time::Instant::now() + state.attempt_timeout;
+        let (pending, empty_reason) =
+            prime_stream(&mut upstream_stream, deadline, STREAM_PREAMBLE_MAX_BYTES).await;
+
+        if let Some(reason) = empty_reason {
+            warn!("Model '{}' streamed no text: {}", target_model, reason);
+            if attempt + 1 < candidates.len() {
+                warn!("Cooling down 30s, trying next candidate...");
+                mark_cooldown(&state, target_model, 30);
+                continue;
+            }
+        }
+
+        let head = futures_util::stream::iter(
+            pending
+                .into_iter()
+                .map(Ok::<Bytes, std::io::Error>),
+        );
+        let tail = upstream_stream.map_err(std::io::Error::other);
+        let stream = head.chain(tail);
 
         return response_builder
-            .body(body)
+            .body(Body::from_stream(stream))
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
     }
 
@@ -959,6 +1115,7 @@ async fn sync_models(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Err
     let catalog_res = state
         .http_client
         .get("https://openrouter.ai/api/v1/models?sort=top-weekly&output_modalities=text")
+        .timeout(Duration::from_secs(30))
         .send()
         .await?
         .json::<OpenRouterCatalogResponse>()
@@ -1193,5 +1350,115 @@ mod modality_tests {
         let c = vec!["not-in-catalog".to_string()];
         let req = vec!["image".to_string()];
         assert_eq!(filter_by_modality(c, &map(&[]), &req, &[]), vec!["not-in-catalog".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    #[test]
+    fn detects_text_delta() {
+        assert!(sse_has_text(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"Halo\"}}]}\n\n"
+        ));
+    }
+
+    #[test]
+    fn ignores_reasoning_only_delta() {
+        assert!(!sse_has_text(
+            b"data: {\"choices\":[{\"delta\":{\"reasoning\":\"thinking...\",\"content\":null}}]}\n\n"
+        ));
+    }
+
+    #[test]
+    fn ignores_keepalive_and_done() {
+        assert!(!sse_has_text(b": keepalive\n\ndata: [DONE]\n\n"));
+        assert!(!sse_has_text(b""));
+    }
+
+    #[test]
+    fn detects_tool_calls() {
+        assert!(sse_has_text(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\"}]}}]}\n\n"
+        ));
+    }
+
+    #[test]
+    fn empty_string_content_is_not_text() {
+        assert!(!sse_has_text(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod prime_tests {
+    use super::*;
+    use std::io;
+
+    fn chunk(s: &'static str) -> Result<Bytes, io::Error> {
+        Ok(Bytes::from_static(s.as_bytes()))
+    }
+
+    fn budget() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(5)
+    }
+
+    #[tokio::test]
+    async fn stops_at_first_text_and_replays_preamble() {
+        let chunks = vec![
+            chunk("data: {\"choices\":[{\"delta\":{\"reasoning\":\"hmm\"}}]}\n\n"),
+            chunk("data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n"),
+            chunk("data: [DONE]\n\n"),
+        ];
+        let mut s = Box::pin(futures_util::stream::iter(chunks));
+        let (pending, reason) = prime_stream(&mut s, budget(), 4096).await;
+
+        assert!(reason.is_none());
+        assert_eq!(pending.len(), 2, "reasoning chunk + first text chunk");
+    }
+
+    #[tokio::test]
+    async fn reports_reasoning_only_stream_as_empty() {
+        let chunks = vec![
+            chunk("data: {\"choices\":[{\"delta\":{\"reasoning\":\"hmm\"}}]}\n\n"),
+            chunk("data: [DONE]\n\n"),
+        ];
+        let mut s = Box::pin(futures_util::stream::iter(chunks));
+        let (pending, reason) = prime_stream(&mut s, budget(), 4096).await;
+
+        assert_eq!(reason, Some("stream ended without text"));
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn handles_line_split_across_chunks() {
+        let chunks = vec![
+            chunk("data: {\"choices\":[{\"delta\":{\"cont"),
+            chunk("ent\":\"Hi\"}}]}\n\n"),
+        ];
+        let mut s = Box::pin(futures_util::stream::iter(chunks));
+        let (_, reason) = prime_stream(&mut s, budget(), 4096).await;
+
+        assert!(reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn bails_out_when_preamble_exceeds_budget() {
+        let big = Box::leak("data: {\"choices\":[{\"delta\":{\"reasoning\":\"x\"}}]}\n\n".repeat(64).into_boxed_str());
+        let chunks: Vec<Result<Bytes, io::Error>> = (0..10).map(|_| chunk(big)).collect();
+        let mut s = Box::pin(futures_util::stream::iter(chunks));
+        let (_, reason) = prime_stream(&mut s, budget(), 512).await;
+
+        assert_eq!(reason, Some("too much output without any text"));
+    }
+
+    #[tokio::test]
+    async fn times_out_when_no_chunks_arrive() {
+        let mut s = Box::pin(futures_util::stream::pending::<Result<Bytes, io::Error>>());
+        let (_, reason) = prime_stream(&mut s, tokio::time::Instant::now(), 4096).await;
+
+        assert_eq!(reason, Some("timed out waiting for the first token"));
     }
 }
