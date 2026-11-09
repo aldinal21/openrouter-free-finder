@@ -8,7 +8,11 @@ use axum::{
 };
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
@@ -60,6 +64,7 @@ pub struct ProcessedModel {
     pub input_modalities: Vec<String>,
     pub top_weekly_rank: usize,
     pub supports_tools: bool,
+    pub supports_reasoning: bool,
 }
 
 #[derive(Debug, Default)]
@@ -67,6 +72,71 @@ pub struct AppState {
     pub models: RwLock<Vec<ProcessedModel>>,
     pub http_client: reqwest::Client,
     pub api_key: Option<String>,
+    /// model_id -> instant until which the model is skipped (recent 429/5xx)
+    pub cooldown: Mutex<HashMap<String, Instant>>,
+}
+
+const COOLDOWN_SECS: u64 = 60;
+
+fn is_cooling(state: &AppState, model: &str) -> bool {
+    let mut map = state.cooldown.lock().unwrap();
+    match map.get(model) {
+        Some(until) if *until > Instant::now() => true,
+        Some(_) => {
+            map.remove(model);
+            false
+        }
+        None => false,
+    }
+}
+
+fn mark_cooldown(state: &AppState, model: &str, secs: u64) {
+    let now = Instant::now();
+    let mut map = state.cooldown.lock().unwrap();
+    if map.len() > 64 {
+        map.retain(|_, until| *until > now);
+    }
+    map.insert(model.to_string(), now + Duration::from_secs(secs));
+}
+
+/// True when the response carries usable assistant text. Unknown shapes pass.
+fn has_text_content(v: &serde_json::Value) -> bool {
+    let Some(msg) = v
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+    else {
+        return true;
+    };
+
+    match msg.get("content") {
+        Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
+        Some(serde_json::Value::Array(a)) => !a.is_empty(),
+        Some(serde_json::Value::Null) | None => false,
+        _ => true,
+    }
+}
+
+/// Drop candidates that are cooling down. If every candidate is cooling down we
+/// return the original list, so a stale cooldown never causes a hard outage.
+fn filter_cooling(state: &AppState, candidates: Vec<String>) -> Vec<String> {
+    let ready: Vec<String> = candidates
+        .iter()
+        .filter(|m| !is_cooling(state, m))
+        .cloned()
+        .collect();
+
+    if ready.is_empty() {
+        return candidates;
+    }
+    if ready.len() < candidates.len() {
+        info!(
+            "Cooldown active: {} of {} candidates skipped",
+            candidates.len() - ready.len(),
+            candidates.len()
+        );
+    }
+    ready
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,6 +205,7 @@ async fn main() {
         models: RwLock::new(Vec::new()),
         http_client: client,
         api_key,
+        cooldown: Mutex::new(HashMap::new()),
     });
 
     info!("Performing initial OpenRouter catalog & ranking fetch...");
@@ -458,11 +529,40 @@ async fn chat_completions(
 
     let all_models = state.models.read().await;
     let candidates = resolve_target_candidates(&requested_model, &all_models);
+
+    // A tiny output budget is fully consumed by reasoning on reasoning-capable
+    // models, leaving `content: null`. Turn reasoning off for those requests.
+    let small_budget = matches!(
+        payload
+            .get("max_tokens")
+            .or_else(|| payload.get("max_completion_tokens"))
+            .and_then(|v| v.as_u64()),
+        Some(n) if n <= 128
+    ) && payload.get("reasoning").is_none();
+
+    let reasoning_capable: std::collections::HashSet<String> = if small_budget {
+        all_models
+            .iter()
+            .filter(|m| m.supports_reasoning)
+            .map(|m| m.id.clone())
+            .collect()
+    } else {
+        Default::default()
+    };
     drop(all_models);
+
+    if small_budget {
+        info!("Small max_tokens budget: reasoning will be disabled per model support");
+    }
+
+    // Skip models that recently returned 429/5xx. If every candidate is cooling
+    // down, the full list is used so a stale cooldown never causes an outage.
+    let candidates = filter_cooling(&state, candidates);
 
     let openrouter_url = "https://openrouter.ai/api/v1/chat/completions";
 
     let mut last_response = None;
+    let mut injected_reasoning = false;
 
     for (attempt, target_model) in candidates.iter().enumerate() {
         if attempt > 0 {
@@ -473,6 +573,16 @@ async fn chat_completions(
 
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("model".to_string(), serde_json::Value::String(target_model.clone()));
+
+            if small_budget && reasoning_capable.contains(target_model) {
+                obj.insert(
+                    "reasoning".to_string(),
+                    serde_json::json!({ "effort": "none" }),
+                );
+                injected_reasoning = true;
+            } else if injected_reasoning {
+                obj.remove("reasoning");
+            }
         }
 
         let upstream_res = match state
@@ -489,20 +599,78 @@ async fn chat_completions(
             Ok(res) => res,
             Err(e) => {
                 error!("Connection error with '{}': {}", target_model, e);
+                mark_cooldown(&state, target_model, 30);
                 continue;
             }
         };
 
         let status = upstream_res.status();
 
-        if (status == StatusCode::TOO_MANY_REQUESTS
+        let is_throttled = status == StatusCode::TOO_MANY_REQUESTS
             || status == StatusCode::SERVICE_UNAVAILABLE
-            || status == StatusCode::BAD_GATEWAY)
-            && attempt + 1 < candidates.len()
-        {
-            warn!("Model '{}' returned status {}. Trying next fallback candidate...", target_model, status);
+            || status == StatusCode::BAD_GATEWAY;
+
+        if is_throttled {
+            mark_cooldown(&state, target_model, COOLDOWN_SECS);
+        }
+
+        if is_throttled && attempt + 1 < candidates.len() {
+            warn!(
+                "Model '{}' returned {}. Cooling down {}s, trying next candidate...",
+                target_model, status, COOLDOWN_SECS
+            );
             last_response = Some(upstream_res);
             continue;
+        }
+
+        // Non-streaming: a 200 with no text content (all tokens spent on reasoning)
+        // is a silent failure for OpenAI clients. Treat it as a failed attempt.
+        let streaming = payload
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if !streaming {
+            let mut response_builder = Response::builder().status(status);
+
+            for (k, v) in upstream_res.headers().iter() {
+                if k == header::CONTENT_TYPE
+                    || k == header::CACHE_CONTROL
+                    || k.as_str().starts_with("x-")
+                {
+                    if let (Ok(hname), Ok(hval)) = (
+                        HeaderName::from_bytes(k.as_str().as_bytes()),
+                        HeaderValue::from_bytes(v.as_bytes()),
+                    ) {
+                        response_builder = response_builder.header(hname, hval);
+                    }
+                }
+            }
+
+            let bytes = match upstream_res.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("Body read error from '{}': {}", target_model, e);
+                    continue;
+                }
+            };
+
+            let empty = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map(|v| !has_text_content(&v))
+                .unwrap_or(false);
+
+            if empty && attempt + 1 < candidates.len() {
+                warn!(
+                    "Model '{}' returned 200 with empty content. Cooling down 30s, trying next candidate...",
+                    target_model
+                );
+                mark_cooldown(&state, target_model, 30);
+                continue;
+            }
+
+            return response_builder
+                .body(Body::from(bytes))
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
         }
 
         let mut response_builder = Response::builder().status(status);
@@ -576,6 +744,10 @@ async fn sync_models(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Err
         };
 
         let supports_tools = raw.supported_parameters.iter().any(|param| param == "tools");
+        let supports_reasoning = raw
+            .supported_parameters
+            .iter()
+            .any(|param| param == "reasoning");
 
         processed.push(ProcessedModel {
             id: raw.id,
@@ -590,6 +762,7 @@ async fn sync_models(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Err
             input_modalities: in_mod,
             top_weekly_rank: rank + 1,
             supports_tools,
+            supports_reasoning,
         });
     }
 
@@ -600,3 +773,63 @@ async fn sync_models(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Err
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with(cooldown: &[&str]) -> AppState {
+        let s = AppState::default();
+        for m in cooldown {
+            mark_cooldown(&s, m, 60);
+        }
+        s
+    }
+
+    fn candidates() -> Vec<String> {
+        vec!["a:free".into(), "b:free".into(), "c:free".into()]
+    }
+
+    #[test]
+    fn keeps_all_when_nothing_cooling() {
+        let s = state_with(&[]);
+        assert_eq!(filter_cooling(&s, candidates()).len(), 3);
+    }
+
+    #[test]
+    fn skips_cooling_model() {
+        let s = state_with(&["a:free"]);
+        let out = filter_cooling(&s, candidates());
+        assert_eq!(out, vec!["b:free".to_string(), "c:free".to_string()]);
+    }
+
+    #[test]
+    fn falls_back_to_full_list_when_all_cooling() {
+        let s = state_with(&["a:free", "b:free", "c:free"]);
+        assert_eq!(filter_cooling(&s, candidates()).len(), 3);
+    }
+
+    #[test]
+    fn expired_cooldown_is_forgotten() {
+        let s = AppState::default();
+        s.cooldown.lock().unwrap().insert(
+            "a:free".to_string(),
+            Instant::now() - Duration::from_secs(1),
+        );
+        assert!(!is_cooling(&s, "a:free"));
+    }
+
+    #[test]
+    fn detects_empty_content() {
+        let null = serde_json::json!({"choices":[{"message":{"content":null}}]});
+        let blank = serde_json::json!({"choices":[{"message":{"content":"  "}}]});
+        let ok = serde_json::json!({"choices":[{"message":{"content":"Hi"}}]});
+        let parts = serde_json::json!({"choices":[{"message":{"content":[{"type":"text","text":"x"}]}}]});
+        assert!(!has_text_content(&null));
+        assert!(!has_text_content(&blank));
+        assert!(has_text_content(&ok));
+        assert!(has_text_content(&parts));
+        assert!(has_text_content(&serde_json::json!({"error":"nope"})));
+    }
+}
+
