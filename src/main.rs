@@ -71,12 +71,12 @@ pub struct AppState {
 
 #[derive(Debug, Deserialize)]
 pub struct FilterQuery {
-    pub variant: Option<String>,     // "free", "paid", "all" (default: "free")
-    pub output: Option<String>,      // default: "text"
-    pub sort: Option<String>,        // "top-weekly", "context", "cheapest", "newest" (default: "top-weekly")
-    pub max_price: Option<f64>,      // max prompt price per token
-    pub tools: Option<bool>,         // require tool support
-    pub limit: Option<usize>,        // default: 20
+    pub variant: Option<String>,
+    pub output: Option<String>,
+    pub sort: Option<String>,
+    pub max_price: Option<f64>,
+    pub tools: Option<bool>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,7 +94,6 @@ pub struct ResponseFilters {
     pub sort: String,
 }
 
-// OpenAI-compatible /v1/models response
 #[derive(Debug, Serialize)]
 pub struct OpenAIModelItem {
     pub id: String,
@@ -145,7 +144,7 @@ async fn main() {
         info!("Initial sync complete.");
     }
 
-    // Spawn background poller (every 15 minutes)
+    // Background poller
     let poller_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(900));
@@ -157,11 +156,14 @@ async fn main() {
         }
     });
 
+    // Support BOTH /v1/models and /models for universal compatibility with OmniRoute & standard OpenAI SDKs
     let app = Router::new()
         .route("/health", get(health_check))
-        .route("/models", get(get_models))
         .route("/v1/models", get(get_openai_models))
+        .route("/models", get(get_openai_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/chat/completions", post(chat_completions))
+        .route("/api/models", get(get_rich_models))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -173,9 +175,8 @@ async fn main() {
         .unwrap_or_else(|e| panic!("Failed to bind {}: {}", addr, e));
 
     info!("🚀 Server running on http://0.0.0.0:{}", port);
-    info!("👉 Local URL: http://127.0.0.1:{}/v1", port);
-    info!("👉 Network LAN URL: http://192.168.1.200:{}/v1", port);
-    info!("👉 Dynamic Aliases: free:top-1, free:top-2, free:context, free:tools, free:coding, cheapest:text");
+    info!("👉 OmniRoute Base URL: http://192.168.1.200:{}", port);
+    info!("👉 OmniRoute Base URL (alt): http://192.168.1.200:{}/v1", port);
 
     axum::serve(listener, app).await.expect("Server error");
 }
@@ -252,7 +253,6 @@ fn filter_and_sort_models(all: &[ProcessedModel], query: &FilterQuery) -> Vec<Pr
     filtered
 }
 
-// Handler standard OpenAI /v1/models (bisa langsung dipakai omniroute/litellm/etc)
 async fn get_openai_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<FilterQuery>,
@@ -303,8 +303,7 @@ async fn get_openai_models(
     }))
 }
 
-// Handler custom rich filter /models
-async fn get_models(
+async fn get_rich_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<FilterQuery>,
 ) -> Result<Json<ApiResponse>, StatusCode> {
@@ -446,7 +445,6 @@ fn resolve_target_candidates(requested: &str, all_models: &[ProcessedModel]) -> 
     }
 }
 
-// Handler POST /v1/chat/completions (Forward & Stream to OpenRouter with Auto-Fallback on 429/503)
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -464,11 +462,16 @@ async fn chat_completions(
             )
         })?;
 
-    let requested_model = payload
+    let mut requested_model = payload
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("auto-free")
         .to_string();
+
+    // Strip prefix if OmniRoute sends prefix prepended (e.g. "openrouter-free/auto-free" -> "auto-free")
+    if let Some(stripped) = requested_model.strip_prefix("openrouter-free/") {
+        requested_model = stripped.to_string();
+    }
 
     let all_models = state.models.read().await;
     let candidates = resolve_target_candidates(&requested_model, &all_models);
@@ -509,7 +512,6 @@ async fn chat_completions(
 
         let status = upstream_res.status();
 
-        // If rate-limited (429) or overloaded (502/503) and there are more candidates, try fallback
         if (status == StatusCode::TOO_MANY_REQUESTS
             || status == StatusCode::SERVICE_UNAVAILABLE
             || status == StatusCode::BAD_GATEWAY)
@@ -520,7 +522,6 @@ async fn chat_completions(
             continue;
         }
 
-        // Success or non-retryable status: stream back directly
         let mut response_builder = Response::builder().status(status);
 
         for (k, v) in upstream_res.headers().iter() {
