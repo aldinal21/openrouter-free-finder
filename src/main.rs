@@ -335,36 +335,19 @@ async fn get_rich_models(
 fn resolve_target_candidates(requested: &str, all_models: &[ProcessedModel]) -> Vec<String> {
     match requested {
         "auto-free" | "free:top-1" => {
-            let q = FilterQuery {
-                variant: Some("free".to_string()),
-                output: Some("text".to_string()),
-                sort: Some("top-weekly".to_string()),
-                max_price: None,
-                tools: None,
-                limit: Some(3),
-            };
-            let list = filter_and_sort_models(all_models, &q);
-            let mut res: Vec<String> = list.into_iter().map(|m| m.id).collect();
-            if res.is_empty() {
-                res.push("stealth/crouton-alpha".to_string());
-            }
-            res
+            vec![
+                "nvidia/nemotron-3-ultra-550b-a55b:free".to_string(),
+                "nvidia/nemotron-3.5-super-vl:free".to_string(),
+                "cohere/north-mini-code:free".to_string(),
+                "stealth/crouton-alpha".to_string(),
+            ]
         }
         "free:top-2" => {
-            let q = FilterQuery {
-                variant: Some("free".to_string()),
-                output: Some("text".to_string()),
-                sort: Some("top-weekly".to_string()),
-                max_price: None,
-                tools: None,
-                limit: Some(4),
-            };
-            let list = filter_and_sort_models(all_models, &q);
-            let mut res: Vec<String> = list.into_iter().skip(1).map(|m| m.id).collect();
-            if res.is_empty() {
-                res.push("nvidia/nemotron-3-ultra-550b-a55b:free".to_string());
-            }
-            res
+            vec![
+                "nvidia/nemotron-3.5-super-vl:free".to_string(),
+                "nvidia/nemotron-3-ultra-550b-a55b:free".to_string(),
+                "cohere/north-mini-code:free".to_string(),
+            ]
         }
         "free:top-3" => {
             let q = FilterQuery {
