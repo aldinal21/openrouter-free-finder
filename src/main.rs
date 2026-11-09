@@ -99,6 +99,66 @@ fn mark_cooldown(state: &AppState, model: &str, secs: u64) {
     map.insert(model.to_string(), now + Duration::from_secs(secs));
 }
 
+/// Rough prompt size estimate: JSON payload of `messages` at ~4 chars per token.
+fn estimate_prompt_tokens(payload: &serde_json::Value) -> u64 {
+    let chars = payload
+        .get("messages")
+        .and_then(|m| serde_json::to_string(m).ok())
+        .map(|s| s.len())
+        .unwrap_or(0);
+    (chars as u64 / 4) + 16
+}
+
+fn payload_output_budget(payload: &serde_json::Value) -> u64 {
+    payload
+        .get("max_tokens")
+        .or_else(|| payload.get("max_completion_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1024)
+}
+
+/// Keep only candidates with a context window big enough for this prompt.
+/// Unknown context (0) or unknown model passes. If nothing fits, keep the
+/// largest-context candidate so the request still has a chance.
+fn filter_by_context(
+    candidates: Vec<String>,
+    context_map: &HashMap<String, u64>,
+    needed: u64,
+) -> Vec<String> {
+    let fitting: Vec<String> = candidates
+        .iter()
+        .filter(|m| match context_map.get(*m) {
+            Some(&ctx) => ctx == 0 || ctx >= needed,
+            None => true,
+        })
+        .cloned()
+        .collect();
+
+    if !fitting.is_empty() {
+        if fitting.len() < candidates.len() {
+            info!(
+                "Context filter: {} of {} candidates too small for ~{} tokens",
+                candidates.len() - fitting.len(),
+                candidates.len(),
+                needed
+            );
+        }
+        return fitting;
+    }
+
+    let largest = candidates
+        .iter()
+        .max_by_key(|m| context_map.get(*m).copied().unwrap_or(0))
+        .cloned();
+
+    warn!(
+        "No candidate fits ~{} tokens; falling back to largest context window",
+        needed
+    );
+
+    largest.into_iter().collect()
+}
+
 /// True when the response carries usable assistant text. Unknown shapes pass.
 fn has_text_content(v: &serde_json::Value) -> bool {
     let Some(msg) = v
@@ -549,11 +609,28 @@ async fn chat_completions(
     } else {
         Default::default()
     };
+
+    // Skip candidates whose context window cannot fit this prompt.
+    let needed = estimate_prompt_tokens(&payload) + payload_output_budget(&payload);
+    let context_map: HashMap<String, u64> = if needed > 4096 {
+        all_models
+            .iter()
+            .map(|m| (m.id.clone(), m.context_length))
+            .collect()
+    } else {
+        Default::default()
+    };
     drop(all_models);
 
     if small_budget {
         info!("Small max_tokens budget: reasoning will be disabled per model support");
     }
+
+    let candidates = if context_map.is_empty() {
+        candidates
+    } else {
+        filter_by_context(candidates, &context_map, needed)
+    };
 
     // Skip models that recently returned 429/5xx. If every candidate is cooling
     // down, the full list is used so a stale cooldown never causes an outage.
@@ -605,6 +682,36 @@ async fn chat_completions(
         };
 
         let status = upstream_res.status();
+
+        // Context overflow: the prompt does not fit this model. Try a bigger one.
+        if status == StatusCode::BAD_REQUEST && attempt + 1 < candidates.len() {
+            let bytes = match upstream_res.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("Body read error from '{}': {}", target_model, e);
+                    continue;
+                }
+            };
+            let lower = String::from_utf8_lossy(&bytes).to_lowercase();
+            let context_overflow = lower.contains("context length")
+                || lower.contains("context_length")
+                || lower.contains("too many tokens")
+                || lower.contains("maximum context");
+
+            if context_overflow {
+                warn!(
+                    "Model '{}' rejected the prompt as too long. Trying next candidate...",
+                    target_model
+                );
+                continue;
+            }
+
+            return Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(bytes))
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
 
         let is_throttled = status == StatusCode::TOO_MANY_REQUESTS
             || status == StatusCode::SERVICE_UNAVAILABLE
@@ -833,3 +940,49 @@ mod tests {
     }
 }
 
+
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn map(pairs: &[(&str, u64)]) -> HashMap<String, u64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn estimates_prompt_size_from_messages() {
+        let p = serde_json::json!({"messages":[{"role":"user","content":"a".repeat(400)}]});
+        let est = estimate_prompt_tokens(&p);
+        assert!(est >= 100 && est <= 140, "got {}", est);
+    }
+
+    #[test]
+    fn drops_candidates_too_small() {
+        let c = vec!["small".to_string(), "big".to_string()];
+        let m = map(&[("small", 8_000), ("big", 200_000)]);
+        assert_eq!(filter_by_context(c, &m, 50_000), vec!["big".to_string()]);
+    }
+
+    #[test]
+    fn keeps_all_when_everything_fits() {
+        let c = vec!["a".to_string(), "b".to_string()];
+        let m = map(&[("a", 128_000), ("b", 200_000)]);
+        assert_eq!(filter_by_context(c, &m, 10_000).len(), 2);
+    }
+
+    #[test]
+    fn picks_largest_when_nothing_fits() {
+        let c = vec!["a".to_string(), "b".to_string()];
+        let m = map(&[("a", 8_000), ("b", 32_000)]);
+        assert_eq!(filter_by_context(c, &m, 500_000), vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn unknown_context_passes() {
+        let c = vec!["unknown".to_string()];
+        let m = map(&[]);
+        assert_eq!(filter_by_context(c, &m, 999_999), vec!["unknown".to_string()]);
+    }
+}
