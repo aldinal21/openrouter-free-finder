@@ -43,6 +43,13 @@ pub struct OpenRouterRawModel {
     pub pricing: Option<ModelPricing>,
     #[serde(default)]
     pub supported_parameters: Vec<String>,
+    pub reasoning: Option<ReasoningInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReasoningInfo {
+    #[serde(default)]
+    pub mandatory: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +72,7 @@ pub struct ProcessedModel {
     pub top_weekly_rank: usize,
     pub supports_tools: bool,
     pub supports_reasoning: bool,
+    pub reasoning_mandatory: bool,
 }
 
 #[derive(Debug, Default)]
@@ -97,6 +105,83 @@ fn mark_cooldown(state: &AppState, model: &str, secs: u64) {
         map.retain(|_, until| *until > now);
     }
     map.insert(model.to_string(), now + Duration::from_secs(secs));
+}
+
+/// Input modalities the client actually sent (image/audio/file/video parts).
+fn required_input_modalities(payload: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
+    let Some(messages) = payload.get("messages").and_then(|m| m.as_array()) else {
+        return out;
+    };
+
+    for msg in messages {
+        let Some(parts) = msg.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for part in parts {
+            let kind = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let modality = match kind {
+                "image_url" | "input_image" | "image" => Some("image"),
+                "input_audio" | "audio" => Some("audio"),
+                "input_file" | "file" => Some("file"),
+                "video_url" | "input_video" | "video" => Some("video"),
+                _ => None,
+            };
+            if let Some(md) = modality {
+                if !out.iter().any(|x| x == md) {
+                    out.push(md.to_string());
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Keep only candidates that accept every modality in `required`. When none of
+/// the route's candidates qualify (e.g. `free:coding` + image), fall back to
+/// catalog models that do, ranked by weekly popularity.
+fn filter_by_modality(
+    candidates: Vec<String>,
+    modality_map: &HashMap<String, Vec<String>>,
+    required: &[String],
+    catalog_fallback: &[String],
+) -> Vec<String> {
+    let fitting: Vec<String> = candidates
+        .iter()
+        .filter(|m| match modality_map.get(*m) {
+            Some(mods) => required.iter().all(|r| mods.contains(r)),
+            None => true,
+        })
+        .cloned()
+        .collect();
+
+    if !fitting.is_empty() {
+        if fitting.len() < candidates.len() {
+            info!(
+                "Modality filter ({}): {} of {} candidates skipped",
+                required.join("+"),
+                candidates.len() - fitting.len(),
+                candidates.len()
+            );
+        }
+        return fitting;
+    }
+
+    if !catalog_fallback.is_empty() {
+        warn!(
+            "No route candidate accepts {}; using catalog models that do",
+            required.join("+")
+        );
+        return catalog_fallback.to_vec();
+    }
+
+    warn!(
+        "No model accepts {}; forwarding with the original candidates",
+        required.join("+")
+    );
+    candidates
 }
 
 /// Rough prompt size estimate: JSON payload of `messages` at ~4 chars per token.
@@ -603,7 +688,7 @@ async fn chat_completions(
     let reasoning_capable: std::collections::HashSet<String> = if small_budget {
         all_models
             .iter()
-            .filter(|m| m.supports_reasoning)
+            .filter(|m| m.supports_reasoning && !m.reasoning_mandatory)
             .map(|m| m.id.clone())
             .collect()
     } else {
@@ -620,11 +705,55 @@ async fn chat_completions(
     } else {
         Default::default()
     };
+
+    // Multimodal requests must land on a model that accepts those modalities.
+    let required_modalities = required_input_modalities(&payload);
+    let modality_map: HashMap<String, Vec<String>> = if required_modalities.is_empty() {
+        Default::default()
+    } else {
+        all_models
+            .iter()
+            .map(|m| (m.id.clone(), m.input_modalities.clone()))
+            .collect()
+    };
+    let modality_fallback: Vec<String> = if required_modalities.is_empty() {
+        Vec::new()
+    } else {
+        let mut fitting: Vec<&ProcessedModel> = all_models
+            .iter()
+            .filter(|m| {
+                m.is_free
+                    && m.output_modalities.iter().any(|o| o == "text")
+                    && required_modalities
+                        .iter()
+                        .all(|r| m.input_modalities.contains(r))
+            })
+            .collect();
+        fitting.sort_by_key(|m| m.top_weekly_rank);
+        fitting.into_iter().map(|m| m.id.clone()).collect()
+    };
     drop(all_models);
 
     if small_budget {
         info!("Small max_tokens budget: reasoning will be disabled per model support");
     }
+    if !required_modalities.is_empty() {
+        info!(
+            "Multimodal request detected: {}",
+            required_modalities.join("+")
+        );
+    }
+
+    let candidates = if modality_map.is_empty() {
+        candidates
+    } else {
+        filter_by_modality(
+            candidates,
+            &modality_map,
+            &required_modalities,
+            &modality_fallback,
+        )
+    };
 
     let candidates = if context_map.is_empty() {
         candidates
@@ -698,10 +827,19 @@ async fn chat_completions(
                 || lower.contains("too many tokens")
                 || lower.contains("maximum context");
 
-            if context_overflow {
+            let modality_mismatch = !required_modalities.is_empty()
+                && (lower.contains("does not support")
+                    || lower.contains("modality")
+                    || lower.contains("image_url")
+                    || lower.contains("image input")
+                    || lower.contains("invalid content")
+                    || lower.contains("unsupported content"));
+
+            if context_overflow || modality_mismatch {
                 warn!(
-                    "Model '{}' rejected the prompt as too long. Trying next candidate...",
-                    target_model
+                    "Model '{}' rejected the request ({}). Trying next candidate...",
+                    target_model,
+                    if context_overflow { "context too long" } else { "modality unsupported" }
                 );
                 continue;
             }
@@ -855,6 +993,11 @@ async fn sync_models(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Err
             .supported_parameters
             .iter()
             .any(|param| param == "reasoning");
+        let reasoning_mandatory = raw
+            .reasoning
+            .as_ref()
+            .map(|r| r.mandatory)
+            .unwrap_or(false);
 
         processed.push(ProcessedModel {
             id: raw.id,
@@ -870,6 +1013,7 @@ async fn sync_models(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Err
             top_weekly_rank: rank + 1,
             supports_tools,
             supports_reasoning,
+            reasoning_mandatory,
         });
     }
 
@@ -984,5 +1128,69 @@ mod context_tests {
         let c = vec!["unknown".to_string()];
         let m = map(&[]);
         assert_eq!(filter_by_context(c, &m, 999_999), vec!["unknown".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod modality_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn map(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn detects_image_parts() {
+        let p = serde_json::json!({"messages":[{"role":"user","content":[
+            {"type":"text","text":"what is this?"},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,xx"}}
+        ]}]});
+        assert_eq!(required_input_modalities(&p), vec!["image".to_string()]);
+    }
+
+    #[test]
+    fn detects_audio_and_dedups() {
+        let p = serde_json::json!({"messages":[
+            {"role":"user","content":[{"type":"input_audio","input_audio":{"data":"xx"}}]},
+            {"role":"user","content":[{"type":"audio","audio":{"data":"yy"}}]}
+        ]});
+        assert_eq!(required_input_modalities(&p), vec!["audio".to_string()]);
+    }
+
+    #[test]
+    fn plain_text_needs_nothing() {
+        let p = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
+        assert!(required_input_modalities(&p).is_empty());
+    }
+
+    #[test]
+    fn keeps_only_vision_capable_candidates() {
+        let c = vec!["text-only".to_string(), "vision".to_string()];
+        let m = map(&[("text-only", &["text"]), ("vision", &["text", "image"])]);
+        let req = vec!["image".to_string()];
+        assert_eq!(
+            filter_by_modality(c, &m, &req, &[]),
+            vec!["vision".to_string()]
+        );
+    }
+
+    #[test]
+    fn falls_back_to_catalog_when_route_has_no_vision_model() {
+        let c = vec!["cohere/north-mini-code:free".to_string()];
+        let m = map(&[("cohere/north-mini-code:free", &["text"])]);
+        let fb = vec!["stealth/crouton-alpha".to_string()];
+        let req = vec!["image".to_string()];
+        assert_eq!(filter_by_modality(c, &m, &req, &fb), fb);
+    }
+
+    #[test]
+    fn unknown_model_passes_through() {
+        let c = vec!["not-in-catalog".to_string()];
+        let req = vec!["image".to_string()];
+        assert_eq!(filter_by_modality(c, &map(&[]), &req, &[]), vec!["not-in-catalog".to_string()]);
     }
 }
