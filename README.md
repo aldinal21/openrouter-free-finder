@@ -62,24 +62,35 @@ cargo build --release
 
 Lokasi: `~/Apps/openrouter-free-finder` di `192.168.1.201`, port `3033`.
 
-```bash
-# build (pakai rustup toolchain, bukan cargo paket Debian yang masih 1.85)
-cd ~/Apps/openrouter-free-finder
-~/.cargo/bin/cargo build --release
+**Build TIDAK dilakukan di Debian.** Debian hanya menerima binary jadi (statis musl,
+tanpa dependency glibc/OpenSSL/Rust). Jadi `rustc`/`cargo` tidak perlu ada di sana.
 
-# service
+### Build dari Windows (cross-compile, static musl)
+```powershell
+# sekali saja
+rustup target add x86_64-unknown-linux-musl
+cargo install cargo-zigbuild        # butuh zig di PATH
+
+# setiap kali ada perubahan kode
+cargo zigbuild --release --target x86_64-unknown-linux-musl
+# hasil: target\x86_64-unknown-linux-musl\release\openrouter-free-finder
+```
+
+### Deploy binary ke Debian
+```powershell
+scp target\x86_64-unknown-linux-musl\release\openrouter-free-finder `
+    aldinal21@192.168.1.201:~/Apps/openrouter-free-finder/target/release/openrouter-free-finder
+ssh aldinal21@192.168.1.201 'systemctl --user restart openrouter-free-finder'
+```
+
+### Service (sekali saja)
+```bash
 systemctl --user daemon-reload
 systemctl --user enable --now openrouter-free-finder
 systemctl --user status openrouter-free-finder
 
 # log
 journalctl --user -u openrouter-free-finder -f
-```
-
-Update kode setelah edit:
-```bash
-cd ~/Apps/openrouter-free-finder
-~/.cargo/bin/cargo build --release && systemctl --user restart openrouter-free-finder
 ```
 
 File service: `~/.config/systemd/user/openrouter-free-finder.service`
